@@ -75,9 +75,12 @@ func main() {
 		log.Fatal("METRICS_AGENT_TOKEN is required")
 	}
 
-	port := os.Getenv("METRICS_AGENT_PORT")
+	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8080"
+		port = os.Getenv("METRICS_AGENT_PORT")
+	}
+	if port == "" {
+		port = "3000"
 	}
 
 	// 初始化 Docker 客户端

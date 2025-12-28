@@ -20,6 +20,6 @@ WORKDIR /app
 
 COPY --from=builder /app/metrics-agent .
 
-EXPOSE 8080
+EXPOSE 3000
 
 CMD ["./metrics-agent"]
