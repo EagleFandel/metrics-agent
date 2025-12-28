@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  metrics-agent:
+    build: .
+    container_name: nomo-metrics-agent
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - METRICS_AGENT_TOKEN=${METRICS_AGENT_TOKEN}
+      - METRICS_AGENT_PORT=8080
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.metrics.rule=Host(`metrics.nomoo.top`)
+      - traefik.http.routers.metrics.entrypoints=https
+      - traefik.http.routers.metrics.tls=true
+      - traefik.http.routers.metrics.tls.certresolver=letsencrypt
+      - traefik.http.services.metrics.loadbalancer.server.port=8080
+    networks:
+      - coolify
+
+networks:
+  coolify:
+    external: true
