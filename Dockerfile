@@ -3,13 +3,13 @@ FROM golang:1.21-alpine AS builder
 
 WORKDIR /app
 
-# 安装依赖
-COPY go.mod go.sum ./
-RUN go mod download
+# 复制源码
+COPY go.mod ./
+COPY main.go ./
 
-# 编译
-COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o metrics-agent .
+# 下载依赖并编译
+RUN go mod tidy && \
+    CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o metrics-agent .
 
 # Runtime stage
 FROM alpine:3.19
