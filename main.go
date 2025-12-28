@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -156,7 +155,7 @@ func listContainersHandler(c *gin.Context) {
 	filter := c.Query("filter")
 
 	ctx := context.Background()
-	containers, err := dockerClient.ContainerList(ctx, container.ListOptions{All: true})
+	containers, err := dockerClient.ContainerList(ctx, types.ContainerListOptions{All: true})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -203,7 +202,7 @@ func allStatsHandler(c *gin.Context) {
 	filter := c.Query("filter")
 
 	ctx := context.Background()
-	containers, err := dockerClient.ContainerList(ctx, container.ListOptions{})
+	containers, err := dockerClient.ContainerList(ctx, types.ContainerListOptions{})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
