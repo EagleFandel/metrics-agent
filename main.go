@@ -21,7 +21,7 @@ var (
 	dockerClient *client.Client
 	authToken    string
 	startTime    time.Time
-	version      = "1.2.2"
+	version      = "1.2.3"
 
 	// 历史数据存储
 	historyMutex   sync.RWMutex
@@ -156,6 +156,7 @@ func main() {
 		api.GET("/containers", listContainersHandler)
 		api.GET("/containers/:id/stats", containerStatsHandler)
 		api.GET("/containers/:id/history", containerHistoryHandler)
+		api.GET("/containers/:id/all", containerAllHandler) // 新增：一次获取所有数据
 		api.POST("/containers/:id/limits", setLimitsHandler)
 		api.GET("/stats", allStatsHandler)
 		api.GET("/requests", requestStatsHandler)
@@ -614,6 +615,69 @@ func getContainerStats(containerID string) (*ContainerStats, error) {
 			TxMB:    float64(txBytes) / 1024 / 1024,
 		},
 	}, nil
+}
+
+// 组合响应结构
+type ContainerAllResponse struct {
+	ContainerID string              `json:"container_id"`
+	Stats       *ContainerStats     `json:"stats"`
+	History     *ContainerHistoryData `json:"history"`
+	Requests    *RequestStats       `json:"requests,omitempty"`
+}
+
+type ContainerHistoryData struct {
+	Network []NetworkHistoryPoint `json:"network"`
+	CPU     []MetricHistoryPoint  `json:"cpu"`
+	Memory  []MetricHistoryPoint  `json:"memory"`
+}
+
+// 获取容器所有数据（stats + history + requests）
+func containerAllHandler(c *gin.Context) {
+	containerID := c.Param("id")
+	domain := c.Query("domain") // 可选，用于获取请求统计
+
+	// 获取统计数据
+	stats, err := getContainerStats(containerID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 获取历史数据
+	historyMutex.RLock()
+	var matchedID string
+	for id := range networkHistory {
+		if strings.HasPrefix(id, containerID) || strings.HasPrefix(containerID, id) {
+			matchedID = id
+			break
+		}
+	}
+	if matchedID == "" {
+		matchedID = containerID
+	}
+
+	history := &ContainerHistoryData{
+		Network: networkHistory[matchedID],
+		CPU:     cpuHistory[matchedID],
+		Memory:  memoryHistory[matchedID],
+	}
+	historyMutex.RUnlock()
+
+	// 获取请求统计（如果提供了域名）
+	var requestStats *RequestStats
+	if domain != "" {
+		rs, err := countRequestsFromTraefikLog(domain)
+		if err == nil {
+			requestStats = rs
+		}
+	}
+
+	c.JSON(http.StatusOK, ContainerAllResponse{
+		ContainerID: stats.ContainerID,
+		Stats:       stats,
+		History:     history,
+		Requests:    requestStats,
+	})
 }
 
 // 计算 CPU 使用率
