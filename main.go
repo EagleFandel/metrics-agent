@@ -21,13 +21,17 @@ var (
 	dockerClient *client.Client
 	authToken    string
 	startTime    time.Time
-	version      = "1.2.1"
+	version      = "1.2.2"
 
 	// 历史数据存储
 	historyMutex   sync.RWMutex
 	networkHistory = make(map[string][]NetworkHistoryPoint) // containerID -> history
 	cpuHistory     = make(map[string][]MetricHistoryPoint)
 	memoryHistory  = make(map[string][]MetricHistoryPoint)
+
+	// 最新 CPU 数据缓存（用于快速响应）
+	cpuCacheMutex sync.RWMutex
+	cpuCache      = make(map[string]float64) // containerID -> cpu percent
 
 	// Traefik 日志路径
 	traefikLogPath = "/var/log/traefik/access.log"
@@ -184,25 +188,47 @@ func collectOnce() {
 		return
 	}
 
-	historyMutex.Lock()
-	defer historyMutex.Unlock()
-
 	now := time.Now()
 	maxPoints := 288 // 24小时 * 12 (每5分钟一个点)
 
 	for _, ctr := range containers {
-		stats, err := getContainerStats(ctr.ID)
+		// 使用流式模式获取准确的 CPU 数据
+		statsResp, err := dockerClient.ContainerStats(ctx, ctr.ID, true)
 		if err != nil {
 			continue
 		}
 
+		decoder := json.NewDecoder(statsResp.Body)
+		var dockerStats types.StatsJSON
+		if err := decoder.Decode(&dockerStats); err != nil {
+			statsResp.Body.Close()
+			continue
+		}
+		statsResp.Body.Close()
+
+		cpuPercent := calculateCPUPercent(&dockerStats)
+		memUsage := float64(dockerStats.MemoryStats.Usage) / 1024 / 1024
+
+		var rxBytes, txBytes uint64
+		for _, netStats := range dockerStats.Networks {
+			rxBytes += netStats.RxBytes
+			txBytes += netStats.TxBytes
+		}
+
 		id := ctr.ID[:12]
+
+		// 更新 CPU 缓存
+		cpuCacheMutex.Lock()
+		cpuCache[id] = cpuPercent
+		cpuCacheMutex.Unlock()
+
+		historyMutex.Lock()
 
 		// 网络历史
 		networkHistory[id] = append(networkHistory[id], NetworkHistoryPoint{
 			Timestamp: now,
-			RxMB:      stats.Network.RxMB,
-			TxMB:      stats.Network.TxMB,
+			RxMB:      float64(rxBytes) / 1024 / 1024,
+			TxMB:      float64(txBytes) / 1024 / 1024,
 		})
 		if len(networkHistory[id]) > maxPoints {
 			networkHistory[id] = networkHistory[id][len(networkHistory[id])-maxPoints:]
@@ -211,7 +237,7 @@ func collectOnce() {
 		// CPU 历史
 		cpuHistory[id] = append(cpuHistory[id], MetricHistoryPoint{
 			Timestamp: now,
-			Value:     stats.CPU.UsagePercent,
+			Value:     cpuPercent,
 		})
 		if len(cpuHistory[id]) > maxPoints {
 			cpuHistory[id] = cpuHistory[id][len(cpuHistory[id])-maxPoints:]
@@ -220,11 +246,13 @@ func collectOnce() {
 		// 内存历史
 		memoryHistory[id] = append(memoryHistory[id], MetricHistoryPoint{
 			Timestamp: now,
-			Value:     stats.Memory.UsageMB,
+			Value:     memUsage,
 		})
 		if len(memoryHistory[id]) > maxPoints {
 			memoryHistory[id] = memoryHistory[id][len(memoryHistory[id])-maxPoints:]
 		}
+
+		historyMutex.Unlock()
 	}
 }
 
@@ -492,7 +520,7 @@ func countRequestsFromTraefikLog(domain string) (*RequestStats, error) {
 	}, nil
 }
 
-// 获取容器统计数据
+// 获取容器统计数据（快速版本，使用缓存的 CPU 数据）
 func getContainerStats(containerID string) (*ContainerStats, error) {
 	ctx := context.Background()
 
@@ -502,22 +530,33 @@ func getContainerStats(containerID string) (*ContainerStats, error) {
 		return nil, err
 	}
 
-	// 使用流式模式获取统计数据，这样可以得到准确的 CPU 使用率
-	statsResp, err := dockerClient.ContainerStats(ctx, containerID, true)
+	// 使用非流式模式快速获取内存和网络数据
+	statsResp, err := dockerClient.ContainerStats(ctx, containerID, false)
 	if err != nil {
 		return nil, err
 	}
 	defer statsResp.Body.Close()
 
-	// 读取第一个统计数据点
 	decoder := json.NewDecoder(statsResp.Body)
 	var dockerStats types.StatsJSON
 	if err := decoder.Decode(&dockerStats); err != nil {
 		return nil, err
 	}
 
-	// 计算 CPU 使用率
-	cpuPercent := calculateCPUPercent(&dockerStats)
+	// 从缓存获取 CPU 数据，如果没有则使用当前计算值
+	shortID := containerID
+	if len(containerID) > 12 {
+		shortID = containerID[:12]
+	}
+
+	cpuCacheMutex.RLock()
+	cpuPercent, hasCached := cpuCache[shortID]
+	cpuCacheMutex.RUnlock()
+
+	if !hasCached {
+		// 没有缓存，计算当前值（可能不准确）
+		cpuPercent = calculateCPUPercent(&dockerStats)
+	}
 
 	// CPU 限制
 	cpuLimit := float64(dockerStats.CPUStats.OnlineCPUs)
@@ -552,7 +591,7 @@ func getContainerStats(containerID string) (*ContainerStats, error) {
 	}
 
 	return &ContainerStats{
-		ContainerID:   containerID[:12],
+		ContainerID:   shortID,
 		ContainerName: containerName,
 		Timestamp:     time.Now(),
 		StartedAt:     startedAt,
