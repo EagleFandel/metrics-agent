@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/docker/docker/api/types"
@@ -20,15 +23,25 @@ var (
 	dockerClient *client.Client
 	authToken    string
 	startTime    time.Time
-	version      = "1.0.0"
+	version      = "1.1.0"
+
+	// 历史数据存储
+	historyMutex   sync.RWMutex
+	networkHistory = make(map[string][]NetworkHistoryPoint) // containerID -> history
+	cpuHistory     = make(map[string][]MetricHistoryPoint)
+	memoryHistory  = make(map[string][]MetricHistoryPoint)
+
+	// Traefik 日志路径
+	traefikLogPath = "/var/log/traefik/access.log"
 )
 
 // 数据结构
 type ContainerInfo struct {
-	ID      string    `json:"id"`
-	Name    string    `json:"name"`
-	Status  string    `json:"status"`
-	Created time.Time `json:"created"`
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Status    string    `json:"status"`
+	Created   time.Time `json:"created"`
+	StartedAt time.Time `json:"started_at"`
 }
 
 type CPUStats struct {
@@ -56,6 +69,7 @@ type ContainerStats struct {
 	ContainerID   string       `json:"container_id"`
 	ContainerName string       `json:"container_name"`
 	Timestamp     time.Time    `json:"timestamp"`
+	StartedAt     time.Time    `json:"started_at"`
 	CPU           CPUStats     `json:"cpu"`
 	Memory        MemoryStats  `json:"memory"`
 	Network       NetworkStats `json:"network"`
@@ -64,6 +78,25 @@ type ContainerStats struct {
 type ResourceLimits struct {
 	CPUCores float64 `json:"cpu_cores"`
 	MemoryMB int64   `json:"memory_mb"`
+}
+
+// 历史数据点
+type NetworkHistoryPoint struct {
+	Timestamp time.Time `json:"timestamp"`
+	RxMB      float64   `json:"rx_mb"`
+	TxMB      float64   `json:"tx_mb"`
+}
+
+type MetricHistoryPoint struct {
+	Timestamp time.Time `json:"timestamp"`
+	Value     float64   `json:"value"`
+}
+
+// 请求统计
+type RequestStats struct {
+	Domain string `json:"domain"`
+	Today  int64  `json:"today"`
+	Total  int64  `json:"total"`
 }
 
 func main() {
@@ -83,6 +116,11 @@ func main() {
 		port = "3000"
 	}
 
+	// Traefik 日志路径可配置
+	if logPath := os.Getenv("TRAEFIK_LOG_PATH"); logPath != "" {
+		traefikLogPath = logPath
+	}
+
 	// 初始化 Docker 客户端
 	var err error
 	dockerClient, err = client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
@@ -99,6 +137,9 @@ func main() {
 	}
 	log.Println("Connected to Docker")
 
+	// 启动历史数据采集
+	go collectHistoryData()
+
 	// 设置 Gin
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.Default()
@@ -112,13 +153,80 @@ func main() {
 	{
 		api.GET("/containers", listContainersHandler)
 		api.GET("/containers/:id/stats", containerStatsHandler)
+		api.GET("/containers/:id/history", containerHistoryHandler)
 		api.POST("/containers/:id/limits", setLimitsHandler)
 		api.GET("/stats", allStatsHandler)
+		api.GET("/requests", requestStatsHandler)
 	}
 
 	log.Printf("Starting metrics-agent v%s on port %s", version, port)
 	if err := r.Run(":" + port); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
+	}
+}
+
+// 定时采集历史数据
+func collectHistoryData() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	// 立即采集一次
+	collectOnce()
+
+	for range ticker.C {
+		collectOnce()
+	}
+}
+
+func collectOnce() {
+	ctx := context.Background()
+	containers, err := dockerClient.ContainerList(ctx, types.ContainerListOptions{})
+	if err != nil {
+		log.Printf("Failed to list containers for history: %v", err)
+		return
+	}
+
+	historyMutex.Lock()
+	defer historyMutex.Unlock()
+
+	now := time.Now()
+	maxPoints := 288 // 24小时 * 12 (每5分钟一个点)
+
+	for _, ctr := range containers {
+		stats, err := getContainerStats(ctr.ID)
+		if err != nil {
+			continue
+		}
+
+		id := ctr.ID[:12]
+
+		// 网络历史
+		networkHistory[id] = append(networkHistory[id], NetworkHistoryPoint{
+			Timestamp: now,
+			RxMB:      stats.Network.RxMB,
+			TxMB:      stats.Network.TxMB,
+		})
+		if len(networkHistory[id]) > maxPoints {
+			networkHistory[id] = networkHistory[id][len(networkHistory[id])-maxPoints:]
+		}
+
+		// CPU 历史
+		cpuHistory[id] = append(cpuHistory[id], MetricHistoryPoint{
+			Timestamp: now,
+			Value:     stats.CPU.UsagePercent,
+		})
+		if len(cpuHistory[id]) > maxPoints {
+			cpuHistory[id] = cpuHistory[id][len(cpuHistory[id])-maxPoints:]
+		}
+
+		// 内存历史
+		memoryHistory[id] = append(memoryHistory[id], MetricHistoryPoint{
+			Timestamp: now,
+			Value:     stats.Memory.UsageMB,
+		})
+		if len(memoryHistory[id]) > maxPoints {
+			memoryHistory[id] = memoryHistory[id][len(memoryHistory[id])-maxPoints:]
+		}
 	}
 }
 
@@ -176,11 +284,19 @@ func listContainersHandler(c *gin.Context) {
 			continue
 		}
 
+		// 获取容器详情以获取 StartedAt
+		inspect, err := dockerClient.ContainerInspect(ctx, ctr.ID)
+		startedAt := time.Time{}
+		if err == nil && inspect.State != nil {
+			startedAt, _ = time.Parse(time.RFC3339Nano, inspect.State.StartedAt)
+		}
+
 		result = append(result, ContainerInfo{
-			ID:      ctr.ID[:12],
-			Name:    name,
-			Status:  ctr.State,
-			Created: time.Unix(ctr.Created, 0),
+			ID:        ctr.ID[:12],
+			Name:      name,
+			Status:    ctr.State,
+			Created:   time.Unix(ctr.Created, 0),
+			StartedAt: startedAt,
 		})
 	}
 
@@ -198,6 +314,34 @@ func containerStatsHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, stats)
+}
+
+// 获取容器历史数据
+func containerHistoryHandler(c *gin.Context) {
+	containerID := c.Param("id")
+
+	historyMutex.RLock()
+	defer historyMutex.RUnlock()
+
+	// 如果 ID 是短格式，尝试匹配
+	var matchedID string
+	for id := range networkHistory {
+		if strings.HasPrefix(id, containerID) || strings.HasPrefix(containerID, id) {
+			matchedID = id
+			break
+		}
+	}
+
+	if matchedID == "" {
+		matchedID = containerID
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"container_id": matchedID,
+		"network":      networkHistory[matchedID],
+		"cpu":          cpuHistory[matchedID],
+		"memory":       memoryHistory[matchedID],
+	})
 }
 
 // 获取所有容器统计
@@ -252,14 +396,12 @@ func setLimitsHandler(c *gin.Context) {
 	updateConfig := container.UpdateConfig{}
 
 	if limits.CPUCores > 0 {
-		// CPU 限制：NanoCPUs = cores * 1e9
 		updateConfig.Resources.NanoCPUs = int64(limits.CPUCores * 1e9)
 	}
 
 	if limits.MemoryMB > 0 {
-		// 内存限制：bytes
 		updateConfig.Resources.Memory = limits.MemoryMB * 1024 * 1024
-		updateConfig.Resources.MemorySwap = limits.MemoryMB * 1024 * 1024 // 禁用 swap
+		updateConfig.Resources.MemorySwap = limits.MemoryMB * 1024 * 1024
 	}
 
 	_, err := dockerClient.ContainerUpdate(ctx, containerID, updateConfig)
@@ -273,6 +415,74 @@ func setLimitsHandler(c *gin.Context) {
 		"container_id": containerID,
 		"limits":       limits,
 	})
+}
+
+// 请求统计 - 解析 Traefik 日志
+func requestStatsHandler(c *gin.Context) {
+	domain := c.Query("domain")
+	if domain == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "domain parameter required"})
+		return
+	}
+
+	stats, err := countRequestsFromTraefikLog(domain)
+	if err != nil {
+		// 如果日志不存在，返回 0
+		c.JSON(http.StatusOK, RequestStats{
+			Domain: domain,
+			Today:  0,
+			Total:  0,
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, stats)
+}
+
+// 解析 Traefik 访问日志统计请求数
+func countRequestsFromTraefikLog(domain string) (*RequestStats, error) {
+	file, err := os.Open(traefikLogPath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var total, today int64
+	todayStr := time.Now().Format("02/Jan/2006")
+
+	// Traefik 日志格式通常包含 Host 头
+	// 示例: 192.168.1.1 - - [29/Dec/2025:12:00:00 +0000] "GET / HTTP/1.1" 200 1234 "-" "-" "5z3n4rxx.nomoo.top"
+	// 或 JSON 格式
+	domainPattern := regexp.MustCompile(`"` + regexp.QuoteMeta(domain) + `"`)
+	datePattern := regexp.MustCompile(`\[(\d{2}/\w{3}/\d{4})`)
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// 检查是否包含目标域名
+		if !domainPattern.MatchString(line) && !strings.Contains(line, domain) {
+			continue
+		}
+
+		total++
+
+		// 检查是否是今天
+		if matches := datePattern.FindStringSubmatch(line); len(matches) > 1 {
+			if matches[1] == todayStr {
+				today++
+			}
+		} else if strings.Contains(line, time.Now().Format("2006-01-02")) {
+			// JSON 格式日期
+			today++
+		}
+	}
+
+	return &RequestStats{
+		Domain: domain,
+		Today:  today,
+		Total:  total,
+	}, nil
 }
 
 // 获取容器统计数据
@@ -331,10 +541,17 @@ func getContainerStats(containerID string) (*ContainerStats, error) {
 
 	containerName := strings.TrimPrefix(inspect.Name, "/")
 
+	// 解析启动时间
+	startedAt := time.Time{}
+	if inspect.State != nil {
+		startedAt, _ = time.Parse(time.RFC3339Nano, inspect.State.StartedAt)
+	}
+
 	return &ContainerStats{
 		ContainerID:   containerID[:12],
 		ContainerName: containerName,
 		Timestamp:     time.Now(),
+		StartedAt:     startedAt,
 		CPU: CPUStats{
 			UsagePercent: cpuPercent,
 			Cores:        cpuPercent / 100 * cpuLimit,
@@ -363,7 +580,6 @@ func calculateCPUPercent(stats *types.StatsJSON) float64 {
 
 	if systemDelta > 0 && cpuDelta > 0 {
 		cpuPercent := (cpuDelta / systemDelta) * float64(stats.CPUStats.OnlineCPUs) * 100.0
-		// 保留两位小数
 		return float64(int(cpuPercent*100)) / 100
 	}
 	return 0
