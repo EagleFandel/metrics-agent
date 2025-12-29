@@ -8,7 +8,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -23,7 +22,7 @@ var (
 	dockerClient *client.Client
 	authToken    string
 	startTime    time.Time
-	version      = "1.1.0"
+	version      = "1.2.0"
 
 	// 历史数据存储
 	historyMutex   sync.RWMutex
@@ -439,6 +438,13 @@ func requestStatsHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, stats)
 }
 
+// Traefik JSON 日志结构
+type TraefikLogEntry struct {
+	RequestHost string `json:"RequestHost"`
+	StartUTC    string `json:"StartUTC"`
+	Time        string `json:"time"`
+}
+
 // 解析 Traefik 访问日志统计请求数
 func countRequestsFromTraefikLog(domain string) (*RequestStats, error) {
 	file, err := os.Open(traefikLogPath)
@@ -448,33 +454,35 @@ func countRequestsFromTraefikLog(domain string) (*RequestStats, error) {
 	defer file.Close()
 
 	var total, today int64
-	todayStr := time.Now().Format("02/Jan/2006")
-
-	// Traefik 日志格式通常包含 Host 头
-	// 示例: 192.168.1.1 - - [29/Dec/2025:12:00:00 +0000] "GET / HTTP/1.1" 200 1234 "-" "-" "5z3n4rxx.nomoo.top"
-	// 或 JSON 格式
-	domainPattern := regexp.MustCompile(`"` + regexp.QuoteMeta(domain) + `"`)
-	datePattern := regexp.MustCompile(`\[(\d{2}/\w{3}/\d{4})`)
+	todayStr := time.Now().Format("2006-01-02")
 
 	scanner := bufio.NewScanner(file)
+	// 增加 buffer 大小以处理长行
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+
 	for scanner.Scan() {
 		line := scanner.Text()
 
-		// 检查是否包含目标域名
-		if !domainPattern.MatchString(line) && !strings.Contains(line, domain) {
-			continue
-		}
-
-		total++
-
-		// 检查是否是今天
-		if matches := datePattern.FindStringSubmatch(line); len(matches) > 1 {
-			if matches[1] == todayStr {
-				today++
+		// 尝试解析 JSON 格式
+		var entry TraefikLogEntry
+		if err := json.Unmarshal([]byte(line), &entry); err == nil {
+			// JSON 格式日志
+			if entry.RequestHost == domain {
+				total++
+				// 检查是否是今天 (StartUTC 格式: 2025-12-29T14:00:31.427569156Z)
+				if strings.HasPrefix(entry.StartUTC, todayStr) || strings.HasPrefix(entry.Time, todayStr) {
+					today++
+				}
 			}
-		} else if strings.Contains(line, time.Now().Format("2006-01-02")) {
-			// JSON 格式日期
-			today++
+		} else {
+			// 回退到文本格式匹配
+			if strings.Contains(line, domain) {
+				total++
+				if strings.Contains(line, todayStr) {
+					today++
+				}
+			}
 		}
 	}
 
