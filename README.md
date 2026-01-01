@@ -1,8 +1,10 @@
-# nomo-metrics-agent
+# metrics-agent
 
-Docker 资源监控与限制服务，为 nomo 平台提供容器级别的 CPU、内存、网络流量监控。
+Lightweight Docker container metrics agent. Provides real-time CPU, memory, and network monitoring for Docker containers via a simple HTTP API.
 
-## 功能
+Perfect for PaaS platforms like [Coolify](https://coolify.io/), custom dashboards, or any application that needs container metrics.
+
+## Features
 
 - 列出所有 Docker 容器
 - 获取容器实时资源统计（CPU、内存、网络）
@@ -90,3 +92,11 @@ curl -H "Authorization: Bearer test123" http://localhost:8080/api/containers
 - 必须设置强密码作为 TOKEN
 - Docker Socket 以只读方式挂载（除了 limits 功能）
 - 建议只允许特定 IP 访问
+
+## Documentation
+
+- [Coolify Integration Guide](docs/COOLIFY_INTEGRATION.md) - Deploy and integrate with Coolify
+
+## License
+
+MIT
