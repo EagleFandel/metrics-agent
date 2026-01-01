@@ -468,12 +468,79 @@ func requestStatsHandler(c *gin.Context) {
 
 // Traefik JSON 日志结构
 type TraefikLogEntry struct {
-	RequestHost string `json:"RequestHost"`
-	StartUTC    string `json:"StartUTC"`
-	Time        string `json:"time"`
+	RequestHost       string `json:"RequestHost"`
+	RequestPath       string `json:"RequestPath"`
+	RequestMethod     string `json:"RequestMethod"`
+	DownstreamStatus  int    `json:"DownstreamStatus"`
+	StartUTC          string `json:"StartUTC"`
+	Time              string `json:"time"`
 }
 
-// 解析 Traefik 访问日志统计请求数
+// 排除的路径前缀（静态资源、API等）
+var excludedPathPrefixes = []string{
+	"/_next/",
+	"/api/",
+	"/favicon",
+	"/robots.txt",
+	"/sitemap",
+	"/.well-known/",
+}
+
+// 排除的扫描路径
+var excludedScanPaths = []string{
+	"/graphql",
+	"/exec",
+	"/nodesync",
+	"/wp-admin",
+	"/wp-login",
+	"/wp-content",
+	"/phpMyAdmin",
+	"/phpmyadmin",
+	"/admin.php",
+	"/shell",
+	"/cmd",
+	"/.env",
+	"/.git",
+	"/config",
+}
+
+// 判断是否为有效的页面访问
+func isValidPageView(entry *TraefikLogEntry) bool {
+	// 只统计 GET 请求
+	if entry.RequestMethod != "GET" {
+		return false
+	}
+	
+	// 只统计 2xx 成功响应
+	if entry.DownstreamStatus < 200 || entry.DownstreamStatus >= 300 {
+		return false
+	}
+	
+	path := entry.RequestPath
+	
+	// 排除静态资源路径
+	for _, prefix := range excludedPathPrefixes {
+		if strings.HasPrefix(path, prefix) {
+			return false
+		}
+	}
+	
+	// 排除扫描路径
+	for _, scanPath := range excludedScanPaths {
+		if strings.Contains(strings.ToLower(path), strings.ToLower(scanPath)) {
+			return false
+		}
+	}
+	
+	// 排除带有可疑参数的请求
+	if strings.Contains(path, "cmd=") || strings.Contains(path, "exec=") {
+		return false
+	}
+	
+	return true
+}
+
+// 解析 Traefik 访问日志统计页面访问数 (PV)
 func countRequestsFromTraefikLog(domain string) (*RequestStats, error) {
 	file, err := os.Open(traefikLogPath)
 	if err != nil {
@@ -496,22 +563,15 @@ func countRequestsFromTraefikLog(domain string) (*RequestStats, error) {
 		var entry TraefikLogEntry
 		if err := json.Unmarshal([]byte(line), &entry); err == nil {
 			// JSON 格式日志
-			if entry.RequestHost == domain {
+			if entry.RequestHost == domain && isValidPageView(&entry) {
 				total++
 				// 检查是否是今天 (StartUTC 格式: 2025-12-29T14:00:31.427569156Z)
 				if strings.HasPrefix(entry.StartUTC, todayStr) || strings.HasPrefix(entry.Time, todayStr) {
 					today++
 				}
 			}
-		} else {
-			// 回退到文本格式匹配
-			if strings.Contains(line, domain) {
-				total++
-				if strings.Contains(line, todayStr) {
-					today++
-				}
-			}
 		}
+		// 不再支持文本格式匹配，因为需要解析更多字段
 	}
 
 	return &RequestStats{
