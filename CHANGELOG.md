@@ -6,6 +6,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).  
 格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，版本遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [v1.2.5] - 2026-02-16
+
+### Added / 新增
+- Added GitHub CI workflow: `.github/workflows/ci.yml`.
+- 新增 GitHub CI 工作流：`.github/workflows/ci.yml`。
+- Added issue templates for bug reports and feature requests.
+- 新增 Bug 与 Feature 的 Issue 模板。
+- Added pull request template and issue template config (including security contact link).
+- 新增 PR 模板和 Issue 配置（包含安全报告入口）。
+
+### Changed / 变更
+- Added CI and Release badges in `README.md`.
+- 在 `README.md` 增加 CI 与 Release 徽章。
+- Improved collaboration baseline for external contributors and maintainers.
+- 强化外部贡献者与维护者的协作基础设施。
+
 ## [v1.2.4] - 2026-02-15
 
 ### Added / 新增
