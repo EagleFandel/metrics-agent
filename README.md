@@ -1,5 +1,8 @@
 ﻿# metrics-agent
 
+[![CI](https://github.com/EagleFandel/metrics-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/EagleFandel/metrics-agent/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/EagleFandel/metrics-agent)](https://github.com/EagleFandel/metrics-agent/releases)
+
 轻量级 Docker 容器监控代理，提供实时 CPU、内存、网络监控和请求统计。
 
 ## 线上地址
@@ -144,3 +147,4 @@ curl -H "Authorization: Bearer test123" http://localhost:3000/api/containers
 ## License
 
 MIT
+
